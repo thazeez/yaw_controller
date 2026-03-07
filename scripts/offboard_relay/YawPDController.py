@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""
+YawPDController.py
+
+Combined controller:
+- XY guidance: desired heading is computed from CURRENT position -> desired position
+- Yaw control: P controller on heading error
+- Forward motion: constant BODY x velocity command
+- BODY y velocity is always zero
+- Z control: WORLD z PD controller using OptiTrack z (like main13.py)
+- BODY z command is solved using PX4 attitude quaternion so the resulting NED vertical
+  velocity matches the WORLD z command as closely as possible through your relay
+
+Publishes:
+- /cmd_vel (geometry_msgs/Twist)
+  linear.x = forward body command (FRD forward)
+  linear.y = 0
+  linear.z = solved body-z command (FRD down)
+  angular.z = yaw-rate command
+
+Use with your relay in another terminal:
+python3 offboard_vel_relay_body3_fullquat_withyaw.py --cmd-timeout 0.3 --offboard-prestream 0.8 --yawrate-max 1.0
+
+Run example:
+python3 YawPDController.py \
+  --pose-topic /Drone/pose \
+  --odom-topic /fmu/out/vehicle_odometry \
+  --x 1.0 --y -1.0 --z 0.7 \
+  --vx-body 0.20 \
+  --kp-z 0.8 --kd-z 0.1 \
+  --kp-yaw 1.0 --yaw-rate-max 0.3 \
+  --yaw-sign -1 \
+  --xy-tol 0.08 --z-tol 0.05 \
+  --slow-radius-xy 0.30 \
+  --vz-world-max 0.40 \
+  --bz-max 0.50 \
+  --warmup 1.0 --hz 50 \
+  --logfile /home/root/YawPDController.csv
+"""
+
+import csv
+import time
+import math
+import argparse
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+
+from geometry_msgs.msg import PoseStamped, Twist
+from px4_msgs.msg import VehicleOdometry
+
+
+def qos_reliable(depth=10):
+    q = QoSProfile(depth=depth)
+    q.history = HistoryPolicy.KEEP_LAST
+    q.reliability = ReliabilityPolicy.RELIABLE
+    q.durability = DurabilityPolicy.VOLATILE
+    return q
+
+
+def qos_best_effort(depth=10):
+    q = QoSProfile(depth=depth)
+    q.history = HistoryPolicy.KEEP_LAST
+    q.reliability = ReliabilityPolicy.BEST_EFFORT
+    q.durability = DurabilityPolicy.VOLATILE
+    return q
+
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def wrap_to_pi(a):
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def yaw_from_quat_xyzw(x, y, z, w):
+    s = 2.0 * (w * z + x * y)
+    c = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(s, c)
+
+
+def quat_to_R_body_to_ned(w, x, y, z):
+    """
+    Rotation matrix R such that:
+        v_ned = R * v_body
+    body = PX4 FRD
+    ned  = PX4 local NED
+    """
+    R = [[0.0] * 3 for _ in range(3)]
+
+    R[0][0] = 1.0 - 2.0 * (y * y + z * z)
+    R[0][1] = 2.0 * (x * y - z * w)
+    R[0][2] = 2.0 * (x * z + y * w)
+
+    R[1][0] = 2.0 * (x * y + z * w)
+    R[1][1] = 1.0 - 2.0 * (x * x + z * z)
+    R[1][2] = 2.0 * (y * z - x * w)
+
+    R[2][0] = 2.0 * (x * z - y * w)
+    R[2][1] = 2.0 * (y * z + x * w)
+    R[2][2] = 1.0 - 2.0 * (x * x + y * y)
+
+    return R
+
+
+class YawPDController(Node):
+    def __init__(self, args):
+        super().__init__("yaw_pd_controller")
+
+        # Topics
+        self.pose_topic = args.pose_topic
+        self.odom_topic = args.odom_topic
+
+        # Goal
+        self.x_des = float(args.x)
+        self.y_des = float(args.y)
+        self.z_des = float(args.z)
+
+        # Forward command in BODY FRD
+        self.vx_body_cmd_const = float(args.vx_body)
+
+        # Z controller (WORLD z)
+        self.kp_z = float(args.kp_z)
+        self.kd_z = float(args.kd_z)
+        self.vz_world_max = float(abs(args.vz_world_max))
+        self.bz_max = float(abs(args.bz_max))
+
+        # Yaw controller
+        self.kp_yaw = float(args.kp_yaw)
+        self.yaw_rate_max = float(abs(args.yaw_rate_max))
+        self.yaw_sign = float(args.yaw_sign)
+
+        # Tolerances
+        self.xy_tol = float(abs(args.xy_tol))
+        self.z_tol = float(abs(args.z_tol))
+        self.slow_radius_xy = float(abs(args.slow_radius_xy))
+
+        # Timing
+        self.warmup_s = float(args.warmup)
+        self.hz = float(args.hz)
+        self.dt = 1.0 / self.hz
+
+        # ROS
+        self.pub = self.create_publisher(Twist, "/cmd_vel", qos_reliable())
+        self.create_subscription(PoseStamped, self.pose_topic, self.pose_cb, qos_best_effort())
+        self.create_subscription(VehicleOdometry, self.odom_topic, self.odom_cb, qos_best_effort())
+
+        # Pose state (OptiTrack)
+        self.have_pose = False
+        self.x_w = 0.0
+        self.y_w = 0.0
+        self.z_w = 0.0
+        self.qx_opti = 0.0
+        self.qy_opti = 0.0
+        self.qz_opti = 0.0
+        self.qw_opti = 1.0
+
+        # PX4 odom quaternion for relay/body-z solving
+        self.have_odom = False
+        self.qw_px4 = 1.0
+        self.qx_px4 = 0.0
+        self.qy_px4 = 0.0
+        self.qz_px4 = 0.0
+
+        # Controller state
+        self.latched = False
+        self.hold = False
+        self.t_start = time.time()
+        self.ez_last = 0.0
+        self.yaw_des_last = 0.0
+
+        # Logging
+        self.f = open(args.logfile, "w", newline="")
+        self.w = csv.writer(self.f)
+        self.w.writerow([
+            "t", "phase",
+            "x", "y", "z",
+            "x_des", "y_des", "z_des",
+            "ex_xy", "ey_xy", "e_xy_norm",
+            "ez", "dez",
+            "yaw_deg", "yaw_des_deg", "yaw_err_deg",
+            "vx_body_cmd", "vy_body_cmd", "vz_body_cmd",
+            "vz_world_up_cmd", "vD_des",
+            "yaw_rate_cmd",
+            "R20", "R21", "R22",
+        ])
+        self.f.flush()
+
+        self.timer = self.create_timer(self.dt, self.loop)
+
+        self.get_logger().info("YawPDController started")
+        self.get_logger().info(f"Goal: ({self.x_des:.3f}, {self.y_des:.3f}, {self.z_des:.3f})")
+        self.get_logger().info(f"Forward body x command: {self.vx_body_cmd_const:.3f} m/s")
+        self.get_logger().info(f"Yaw sign: {self.yaw_sign}")
+        self.get_logger().info(f"Logging to: {args.logfile}")
+
+    def pose_cb(self, msg: PoseStamped):
+        p = msg.pose.position
+        q = msg.pose.orientation
+
+        self.x_w = float(p.x)
+        self.y_w = float(p.y)
+        self.z_w = float(p.z)
+
+        x = float(q.x)
+        y = float(q.y)
+        z = float(q.z)
+        w = float(q.w)
+
+        n = math.sqrt(w * w + x * x + y * y + z * z)
+        if n > 1e-9:
+            x /= n
+            y /= n
+            z /= n
+            w /= n
+
+        self.qx_opti = x
+        self.qy_opti = y
+        self.qz_opti = z
+        self.qw_opti = w
+
+        self.have_pose = True
+
+    def odom_cb(self, msg: VehicleOdometry):
+        w, x, y, z = float(msg.q[0]), float(msg.q[1]), float(msg.q[2]), float(msg.q[3])
+        n = math.sqrt(w * w + x * x + y * y + z * z)
+        if n > 1e-9:
+            w, x, y, z = w / n, x / n, y / n, z / n
+
+        self.qw_px4 = w
+        self.qx_px4 = x
+        self.qy_px4 = y
+        self.qz_px4 = z
+        self.have_odom = True
+
+    def publish_cmd(self, bx, by, bz, yaw_rate):
+        msg = Twist()
+        msg.linear.x = float(bx)
+        msg.linear.y = float(by)
+        msg.linear.z = float(bz)
+        msg.angular.x = 0.0
+        msg.angular.y = 0.0
+        msg.angular.z = float(yaw_rate)
+        self.pub.publish(msg)
+
+    def loop(self):
+        t = time.time() - self.t_start
+
+        if not self.have_pose or not self.have_odom:
+            self.publish_cmd(0.0, 0.0, 0.0, 0.0)
+            return
+
+        # Current yaw from Opti quaternion
+        yaw_raw = yaw_from_quat_xyzw(self.qx_opti, self.qy_opti, self.qz_opti, self.qw_opti)
+        yaw = wrap_to_pi(self.yaw_sign * yaw_raw)
+
+        # XY errors in WORLD
+        ex_xy = self.x_des - self.x_w
+        ey_xy = self.y_des - self.y_w
+        e_xy_norm = math.sqrt(ex_xy * ex_xy + ey_xy * ey_xy)
+
+        # Z error in WORLD
+        ez = self.z_des - self.z_w
+
+        if (not self.latched) and (t >= self.warmup_s):
+            self.latched = True
+            self.ez_last = ez
+            if e_xy_norm > 1e-9:
+                self.yaw_des_last = math.atan2(ey_xy, ex_xy)
+            else:
+                self.yaw_des_last = yaw
+
+        # Warmup
+        if not self.latched:
+            self.publish_cmd(0.0, 0.0, 0.0, 0.0)
+            self.w.writerow([
+                f"{t:.3f}", "warmup",
+                f"{self.x_w:.3f}", f"{self.y_w:.3f}", f"{self.z_w:.3f}",
+                f"{self.x_des:.3f}", f"{self.y_des:.3f}", f"{self.z_des:.3f}",
+                f"{ex_xy:.3f}", f"{ey_xy:.3f}", f"{e_xy_norm:.3f}",
+                f"{ez:.3f}", "0.000",
+                f"{math.degrees(yaw):.3f}", "nan", "nan",
+                "0.000", "0.000", "0.000",
+                "0.000", "0.000",
+                "0.000",
+                "0.000000", "0.000000", "0.000000",
+            ])
+            self.f.flush()
+            return
+
+        # Desired heading from CURRENT position -> desired position
+        if e_xy_norm > self.xy_tol:
+            yaw_des = math.atan2(ey_xy, ex_xy)
+            self.yaw_des_last = yaw_des
+        else:
+            yaw_des = self.yaw_des_last
+
+        yaw_err = wrap_to_pi(yaw_des - yaw)
+        yaw_rate_cmd = clamp(self.kp_yaw * yaw_err, -self.yaw_rate_max, self.yaw_rate_max)
+
+        # WORLD z PD controller
+        dez = (ez - self.ez_last) / self.dt
+        self.ez_last = ez
+
+        vz_world_up_cmd = self.kp_z * ez + self.kd_z * dez
+        vz_world_up_cmd = clamp(vz_world_up_cmd, -self.vz_world_max, self.vz_world_max)
+
+        # Convert world up command -> NED down command
+        vD_des = -vz_world_up_cmd
+
+        # BODY command
+        # Move forward until close to XY goal, then stop forward motion.
+        if e_xy_norm > self.xy_tol:
+            scale_xy = 1.0
+            if self.slow_radius_xy > 1e-9:
+                scale_xy = clamp(e_xy_norm / self.slow_radius_xy, 0.0, 1.0)
+            bx_cmd = self.vx_body_cmd_const * scale_xy
+        else:
+            bx_cmd = 0.0
+
+        by_cmd = 0.0
+
+        # Solve body z so relay's rotation gives desired NED vertical velocity:
+        # vD = R20*bx + R21*by + R22*bz
+        R_nb = quat_to_R_body_to_ned(self.qw_px4, self.qx_px4, self.qy_px4, self.qz_px4)
+        R20 = R_nb[2][0]
+        R21 = R_nb[2][1]
+        R22 = R_nb[2][2]
+
+        if abs(R22) > 1e-6:
+            bz_cmd = (vD_des - R20 * bx_cmd - R21 * by_cmd) / R22
+        else:
+            # Fallback if nearly singular
+            bz_cmd = vD_des
+
+        bz_cmd = clamp(bz_cmd, -self.bz_max, self.bz_max)
+
+        # Hold logic
+        if e_xy_norm <= self.xy_tol and abs(ez) <= self.z_tol:
+            self.hold = True
+        else:
+            self.hold = False
+
+        if self.hold:
+            bx_cmd = 0.0
+            by_cmd = 0.0
+            # keep z stabilized
+            if abs(R22) > 1e-6:
+                bz_cmd = clamp(vD_des / R22, -self.bz_max, self.bz_max)
+            else:
+                bz_cmd = clamp(vD_des, -self.bz_max, self.bz_max)
+            yaw_rate_cmd = 0.0
+            phase = "hold"
+        else:
+            phase = "track"
+
+        self.publish_cmd(bx_cmd, by_cmd, bz_cmd, yaw_rate_cmd)
+
+        self.w.writerow([
+            f"{t:.3f}", phase,
+            f"{self.x_w:.3f}", f"{self.y_w:.3f}", f"{self.z_w:.3f}",
+            f"{self.x_des:.3f}", f"{self.y_des:.3f}", f"{self.z_des:.3f}",
+            f"{ex_xy:.3f}", f"{ey_xy:.3f}", f"{e_xy_norm:.3f}",
+            f"{ez:.3f}", f"{dez:.3f}",
+            f"{math.degrees(yaw):.3f}",
+            f"{math.degrees(yaw_des):.3f}",
+            f"{math.degrees(yaw_err):.3f}",
+            f"{bx_cmd:.3f}", f"{by_cmd:.3f}", f"{bz_cmd:.3f}",
+            f"{vz_world_up_cmd:.3f}", f"{vD_des:.3f}",
+            f"{yaw_rate_cmd:.3f}",
+            f"{R20:.6f}", f"{R21:.6f}", f"{R22:.6f}",
+        ])
+        self.f.flush()
+
+
+def main():
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--pose-topic", default="/Drone/pose")
+    p.add_argument("--odom-topic", default="/fmu/out/vehicle_odometry")
+
+    p.add_argument("--x", type=float, required=True, help="Desired world x")
+    p.add_argument("--y", type=float, required=True, help="Desired world y")
+    p.add_argument("--z", type=float, required=True, help="Desired world z")
+
+    p.add_argument("--vx-body", type=float, default=0.10, help="Constant forward body x velocity (m/s)")
+    p.add_argument("--kp-z", type=float, default=0.6)
+    p.add_argument("--kd-z", type=float, default=0.0)
+    p.add_argument("--vz-world-max", type=float, default=0.30, help="Max WORLD vertical speed magnitude (m/s, up/down)")
+    p.add_argument("--bz-max", type=float, default=0.50, help="Max BODY z command magnitude (FRD down, m/s)")
+
+    p.add_argument("--kp-yaw", type=float, default=0.6)
+    p.add_argument("--yaw-rate-max", type=float, default=0.3)
+    p.add_argument("--yaw-sign", type=float, default=-1.0)
+
+    p.add_argument("--xy-tol", type=float, default=0.08)
+    p.add_argument("--z-tol", type=float, default=0.05)
+    p.add_argument("--slow-radius-xy", type=float, default=0.10)
+
+    p.add_argument("--warmup", type=float, default=1.0)
+    p.add_argument("--hz", type=float, default=50.0)
+
+    p.add_argument("--logfile", default="/home/root/YawPDController.csv")
+
+    args = p.parse_args()
+
+    rclpy.init()
+    node = YawPDController(args)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.publish_cmd(0.0, 0.0, 0.0, 0.0)
+        node.f.close()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
