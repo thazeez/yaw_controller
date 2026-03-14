@@ -292,7 +292,7 @@ class YawPDController(Node):
 
         # Desired heading from CURRENT position -> desired position
         if e_xy_norm > self.xy_tol:
-            yaw_des = math.atan2(ey_xy, ex_xy)
+            yaw_des = math.atan2(-ey_xy, ex_xy)
             self.yaw_des_last = yaw_des
         else:
             yaw_des = self.yaw_des_last
