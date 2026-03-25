@@ -2,31 +2,15 @@
 """
 YawPDController.py
 
-Combined controller:
-- XY guidance: desired heading is computed from CURRENT position -> desired position
-- Yaw control: P controller on heading error
-- Forward motion: constant BODY x velocity command
-- BODY y velocity is always zero
-- Z control: WORLD z PD controller using OptiTrack z (like main13.py)
-- BODY z command is solved using PX4 attitude quaternion so the resulting NED vertical
-  velocity matches the WORLD z command as closely as possible through your relay
+HOW TO RUN IN TERMINAL:
 
-Publishes:
-- /cmd_vel (geometry_msgs/Twist)
-  linear.x = forward body command (FRD forward)
-  linear.y = 0
-  linear.z = solved body-z command (FRD down)
-  angular.z = yaw-rate command
-
-Use with your relay in another terminal:
-python3 offboard_vel_relay_body3_fullquat_withyaw.py --cmd-timeout 0.3 --offboard-prestream 0.8 --yawrate-max 1.0
-
-Run example:
 python3 YawPDController.py \
   --pose-topic /Drone/pose \
   --odom-topic /fmu/out/vehicle_odometry \
   --x 1.0 --y -1.0 --z 0.7 \
   --vx-body 0.20 \
+  --vx-body-max 0.30 \
+  --ax-body-max 0.80 \
   --kp-z 0.8 --kd-z 0.1 \
   --kp-yaw 1.0 --yaw-rate-max 0.3 \
   --yaw-sign -1 \
@@ -36,6 +20,34 @@ python3 YawPDController.py \
   --bz-max 0.50 \
   --warmup 1.0 --hz 50 \
   --logfile /home/root/YawPDController.csv
+
+
+WHAT THIS DOES:
+- XY guidance: desired heading is computed from CURRENT position -> desired position
+- Yaw control: P controller on heading error
+- Forward motion: BODY x velocity command
+- BODY y velocity is always zero
+- Z control: WORLD z PD controller using OptiTrack z
+- BODY z command is solved using PX4 attitude quaternion so the resulting NED vertical
+  velocity matches the WORLD z command as closely as possible through your relay
+
+NEW (minimal change):
+- Forward BODY x command is speed-limited and acceleration-limited
+- Decision uses measured BODY x velocity
+- Ramp uses previous commanded BODY x velocity
+
+PUBISHES:
+- /cmd_vel (geometry_msgs/Twist)
+  linear.x = forward body command (FRD forward)
+  linear.y = 0
+  linear.z = solved body-z command (FRD down)
+  angular.z = yaw-rate command
+
+USE WITH YOUR RELAY IN ANOTHER TERMINAL:
+python3 offboard_vel_relay_body3_fullquat_withyaw.py \
+  --cmd-timeout 0.3 \
+  --offboard-prestream 0.8 \
+  --yawrate-max 1.0
 """
 
 import csv
@@ -105,6 +117,17 @@ def quat_to_R_body_to_ned(w, x, y, z):
     return R
 
 
+def Rt_times_v(R, v):
+    """
+    v_body = R^T * v_ned
+    """
+    return [
+        R[0][0] * v[0] + R[1][0] * v[1] + R[2][0] * v[2],
+        R[0][1] * v[0] + R[1][1] * v[1] + R[2][1] * v[2],
+        R[0][2] * v[0] + R[1][2] * v[1] + R[2][2] * v[2],
+    ]
+
+
 class YawPDController(Node):
     def __init__(self, args):
         super().__init__("yaw_pd_controller")
@@ -120,6 +143,10 @@ class YawPDController(Node):
 
         # Forward command in BODY FRD
         self.vx_body_cmd_const = float(args.vx_body)
+
+        # NEW: body x speed/acceleration limits
+        self.vx_body_max = float(args.vx_body_max)
+        self.ax_body_max = float(args.ax_body_max)
 
         # Z controller (WORLD z)
         self.kp_z = float(args.kp_z)
@@ -164,12 +191,23 @@ class YawPDController(Node):
         self.qy_px4 = 0.0
         self.qz_px4 = 0.0
 
+        # PX4 odom NED velocity + measured body velocity
+        self.vN_m = 0.0
+        self.vE_m = 0.0
+        self.vD_m = 0.0
+        self.vx_body_m = 0.0
+        self.vy_body_m = 0.0
+        self.vz_body_m = 0.0
+
         # Controller state
         self.latched = False
         self.hold = False
         self.t_start = time.time()
         self.ez_last = 0.0
         self.yaw_des_last = 0.0
+
+        # Previous commanded body x for acceleration limiting
+        self.vx_body_prev = 0.0
 
         # Logging
         self.f = open(args.logfile, "w", newline="")
@@ -182,6 +220,7 @@ class YawPDController(Node):
             "ez", "dez",
             "yaw_deg", "yaw_des_deg", "yaw_err_deg",
             "vx_body_cmd", "vy_body_cmd", "vz_body_cmd",
+            "vx_body_raw", "vx_body_meas",
             "vz_world_up_cmd", "vD_des",
             "yaw_rate_cmd",
             "R20", "R21", "R22",
@@ -233,6 +272,16 @@ class YawPDController(Node):
         self.qx_px4 = x
         self.qy_px4 = y
         self.qz_px4 = z
+
+        self.vN_m = float(msg.velocity[0])
+        self.vE_m = float(msg.velocity[1])
+        self.vD_m = float(msg.velocity[2])
+
+        R_nb = quat_to_R_body_to_ned(self.qw_px4, self.qx_px4, self.qy_px4, self.qz_px4)
+        self.vx_body_m, self.vy_body_m, self.vz_body_m = Rt_times_v(
+            R_nb, [self.vN_m, self.vE_m, self.vD_m]
+        )
+
         self.have_odom = True
 
     def publish_cmd(self, bx, by, bz, yaw_rate):
@@ -283,6 +332,7 @@ class YawPDController(Node):
                 f"{ez:.3f}", "0.000",
                 f"{math.degrees(yaw):.3f}", "nan", "nan",
                 "0.000", "0.000", "0.000",
+                "0.000", f"{self.vx_body_m:.3f}",
                 "0.000", "0.000",
                 "0.000",
                 "0.000000", "0.000000", "0.000000",
@@ -310,16 +360,33 @@ class YawPDController(Node):
         # Convert world up command -> NED down command
         vD_des = -vz_world_up_cmd
 
-        # BODY command
-        # Move forward until close to XY goal, then stop forward motion.
+        # BODY forward command before limiting
         if e_xy_norm > self.xy_tol:
             scale_xy = 1.0
             if self.slow_radius_xy > 1e-9:
                 scale_xy = clamp(e_xy_norm / self.slow_radius_xy, 0.0, 1.0)
-            bx_cmd = self.vx_body_cmd_const * scale_xy
+            vx_body_raw = self.vx_body_cmd_const * scale_xy
         else:
-            bx_cmd = 0.0
+            vx_body_raw = 0.0
 
+        # Speed clip to ±vx_body_max
+        vel_cmd = clamp(vx_body_raw, -self.vx_body_max, self.vx_body_max)
+
+        # Acceleration required from measured body x velocity
+        computed_acceleration = (vel_cmd - self.vx_body_m) / self.dt
+
+        # Acceleration limit
+        if abs(computed_acceleration) > self.ax_body_max:
+            vx_body_cmd = self.vx_body_prev + math.copysign(
+                self.ax_body_max * self.dt,
+                vel_cmd - self.vx_body_prev
+            )
+        else:
+            vx_body_cmd = vel_cmd
+
+        self.vx_body_prev = vx_body_cmd
+
+        bx_cmd = vx_body_cmd
         by_cmd = 0.0
 
         # Solve body z so relay's rotation gives desired NED vertical velocity:
@@ -346,6 +413,7 @@ class YawPDController(Node):
         if self.hold:
             bx_cmd = 0.0
             by_cmd = 0.0
+            self.vx_body_prev = 0.0
             # keep z stabilized
             if abs(R22) > 1e-6:
                 bz_cmd = clamp(vD_des / R22, -self.bz_max, self.bz_max)
@@ -368,6 +436,7 @@ class YawPDController(Node):
             f"{math.degrees(yaw_des):.3f}",
             f"{math.degrees(yaw_err):.3f}",
             f"{bx_cmd:.3f}", f"{by_cmd:.3f}", f"{bz_cmd:.3f}",
+            f"{vx_body_raw:.3f}", f"{self.vx_body_m:.3f}",
             f"{vz_world_up_cmd:.3f}", f"{vD_des:.3f}",
             f"{yaw_rate_cmd:.3f}",
             f"{R20:.6f}", f"{R21:.6f}", f"{R22:.6f}",
@@ -386,6 +455,9 @@ def main():
     p.add_argument("--z", type=float, required=True, help="Desired world z")
 
     p.add_argument("--vx-body", type=float, default=0.10, help="Constant forward body x velocity (m/s)")
+    p.add_argument("--vx-body-max", type=float, default=0.30, help="Max body x velocity magnitude (m/s)")
+    p.add_argument("--ax-body-max", type=float, default=0.80, help="Max body x acceleration magnitude (m/s^2)")
+
     p.add_argument("--kp-z", type=float, default=0.6)
     p.add_argument("--kd-z", type=float, default=0.0)
     p.add_argument("--vz-world-max", type=float, default=0.30, help="Max WORLD vertical speed magnitude (m/s, up/down)")
