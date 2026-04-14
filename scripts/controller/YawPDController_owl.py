@@ -39,11 +39,17 @@ NEW (minimal change):
 - hold is sticky once reached
 
 PUBLISHES:
-- /cmd_vel (geometry_msgs/Twist)
+- /owl/cmd_vel (geometry_msgs/Twist)
   linear.x = forward body command (FRD forward)
   linear.y = 0
   linear.z = solved body-z command (FRD down)
   angular.z = yaw-rate command
+
+USE WITH YOUR RELAY IN ANOTHER TERMINAL:
+python3 offboard_vel_relay_body3_fullquat_withyaw.py \
+  --cmd-timeout 0.3 \
+  --offboard-prestream 0.8 \
+  --yawrate-max 1.0
 """
 
 import csv
@@ -217,8 +223,11 @@ class YawPDController(Node):
             "ez", "dez",
             "yaw_deg", "yaw_des_deg", "yaw_err_deg",
             "vx_body_cmd", "vy_body_cmd", "vz_body_cmd",
-            "vx_body_raw", "vx_body_meas",
-            "vz_world_up_cmd", "vD_des",
+            "vx_body_raw",
+            "vx_body_meas", "vy_body_meas", "vz_body_meas",
+            "vz_world_up_raw", "vz_world_up_cmd",
+            "vD_des",
+            "vz_body_raw",
             "yaw_rate_cmd",
             "R20", "R21", "R22",
         ])
@@ -332,8 +341,11 @@ class YawPDController(Node):
                 f"{ez:.3f}", "0.000",
                 f"{math.degrees(yaw):.3f}", "nan", "nan",
                 "0.000", "0.000", "0.000",
-                "0.000", f"{self.vx_body_m:.3f}",
+                "0.000",
+                f"{self.vx_body_m:.3f}", f"{self.vy_body_m:.3f}", f"{self.vz_body_m:.3f}",
                 "0.000", "0.000",
+                "0.000",
+                "0.000",
                 "0.000",
                 "0.000000", "0.000000", "0.000000",
             ])
@@ -353,11 +365,11 @@ class YawPDController(Node):
         yaw_rate_cmd = clamp(self.kp_yaw * yaw_err, -self.yaw_rate_max, self.yaw_rate_max)
 
         # WORLD z PD controller
+        vz_world_up_raw = self.kp_z * ez + self.kd_z * ((ez - self.ez_last) / self.dt)
         dez = (ez - self.ez_last) / self.dt
         self.ez_last = ez
 
-        vz_world_up_cmd = self.kp_z * ez + self.kd_z * dez
-        vz_world_up_cmd = clamp(vz_world_up_cmd, -self.vz_world_max, self.vz_world_max)
+        vz_world_up_cmd = clamp(vz_world_up_raw, -self.vz_world_max, self.vz_world_max)
 
         # Convert WORLD up command -> NED down command
         vD_des = -vz_world_up_cmd
@@ -400,12 +412,12 @@ class YawPDController(Node):
         R22 = R_nb[2][2]
 
         if abs(R22) > 1e-6:
-            bz_cmd = (vD_des - R20 * bx_cmd - R21 * by_cmd) / R22
+            vz_body_raw = (vD_des - R20 * bx_cmd - R21 * by_cmd) / R22
         else:
             # Fallback if nearly singular
-            bz_cmd = vD_des
+            vz_body_raw = vD_des
 
-        bz_cmd = clamp(bz_cmd, -self.bz_max, self.bz_max)
+        bz_cmd = clamp(vz_body_raw, -self.bz_max, self.bz_max)
 
         # Sticky hold logic
         if not self.hold:
@@ -418,8 +430,10 @@ class YawPDController(Node):
             self.vx_body_prev = 0.0
             # Keep z stabilized
             if abs(R22) > 1e-6:
-                bz_cmd = clamp(vD_des / R22, -self.bz_max, self.bz_max)
+                vz_body_raw = vD_des / R22
+                bz_cmd = clamp(vz_body_raw, -self.bz_max, self.bz_max)
             else:
+                vz_body_raw = vD_des
                 bz_cmd = clamp(vD_des, -self.bz_max, self.bz_max)
             yaw_rate_cmd = 0.0
             phase = "hold"
@@ -438,8 +452,11 @@ class YawPDController(Node):
             f"{math.degrees(yaw_des):.3f}",
             f"{math.degrees(yaw_err):.3f}",
             f"{bx_cmd:.3f}", f"{by_cmd:.3f}", f"{bz_cmd:.3f}",
-            f"{vx_body_raw:.3f}", f"{self.vx_body_m:.3f}",
-            f"{vz_world_up_cmd:.3f}", f"{vD_des:.3f}",
+            f"{vx_body_raw:.3f}",
+            f"{self.vx_body_m:.3f}", f"{self.vy_body_m:.3f}", f"{self.vz_body_m:.3f}",
+            f"{vz_world_up_raw:.3f}", f"{vz_world_up_cmd:.3f}",
+            f"{vD_des:.3f}",
+            f"{vz_body_raw:.3f}",
             f"{yaw_rate_cmd:.3f}",
             f"{R20:.6f}", f"{R21:.6f}", f"{R22:.6f}",
         ])
@@ -457,7 +474,7 @@ class YawPDController(Node):
 def main():
     p = argparse.ArgumentParser()
 
-    # Owl-specific defaults
+    # Falcon-specific defaults
     p.add_argument("--pose-topic", default="/Drone_owl/pose")
     p.add_argument("--odom-topic", default="/owl/fmu/out/vehicle_odometry")
 
