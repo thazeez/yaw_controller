@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+plot_yaw_pd_controller_waypoint_logs.py
+
+Same as plot_yaw_pd_controller_logs.py, but with waypoint additions:
+- XY trajectory shows waypoint 1 and waypoint 2
+- x/y/z vs time shows changing x_des, y_des, z_des
+- Adds waypoint switching plot using current_goal
+
+IMPORTANT:
+- This version does NOT sort by t because waypoint logs reset t after switching.
+"""
+
+import argparse
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def to_num(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+
+def load_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+
+    for c in df.columns:
+        if c == "phase":
+            df[c] = df[c].astype(str)
+        else:
+            df[c] = to_num(df[c])
+
+    if "t" not in df.columns:
+        raise ValueError(f"{path} does not contain required column 't'")
+
+    # DO NOT SORT BY t. Waypoint controller resets t after each switch.
+    df = df.dropna(subset=["t"]).copy()
+    df = df.reset_index(drop=True)
+    return df
+
+
+def get_col(df: pd.DataFrame, name: str) -> np.ndarray:
+    if name in df.columns:
+        return df[name].to_numpy(dtype=float)
+    return np.full(len(df), np.nan, dtype=float)
+
+
+def sanitize_name(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
+
+
+def safe_gradient(y: np.ndarray, t: np.ndarray) -> np.ndarray:
+    y = np.asarray(y, dtype=float)
+    t = np.asarray(t, dtype=float)
+
+    out = np.full_like(y, np.nan, dtype=float)
+
+    good = np.isfinite(y) & np.isfinite(t)
+    if good.sum() < 2:
+        return out
+
+    idx = np.where(good)[0]
+    out[idx] = np.gradient(y[idx], t[idx])
+    return out
+
+
+def first_finite(a):
+    a = np.asarray(a, dtype=float)
+    good = a[np.isfinite(a)]
+    if len(good) == 0:
+        return np.nan
+    return float(good[0])
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("csv", nargs="+", help="CSV log files")
+    parser.add_argument("--show", action="store_true", help="Display figures")
+    parser.add_argument("--outdir", default="", help="Directory to save PNG figures")
+    parser.add_argument("--prefix", default="YawPDWaypoint", help="Prefix for saved figure filenames")
+    parser.add_argument("--decimate", type=int, default=1, help="Plot every Nth point")
+    args = parser.parse_args()
+
+    save = bool(args.outdir)
+    if save:
+        os.makedirs(args.outdir, exist_ok=True)
+
+    dec = max(1, args.decimate)
+    sl = slice(None, None, dec)
+
+    for csv_path in args.csv:
+        df = load_csv(csv_path)
+        stem = sanitize_name(Path(csv_path).stem)
+
+        t = get_col(df, "t")
+
+        # Position
+        x = get_col(df, "x")
+        y = get_col(df, "y")
+        z = get_col(df, "z")
+        x_des = get_col(df, "x_des")
+        y_des = get_col(df, "y_des")
+        z_des = get_col(df, "z_des")
+        e_xy_norm = get_col(df, "e_xy_norm")
+
+        # Waypoint
+        current_goal = get_col(df, "current_goal")
+        has_goal = np.isfinite(current_goal).any()
+
+        wp1 = None
+        wp2 = None
+        if has_goal:
+            g1 = df[df["current_goal"] == 1]
+            g2 = df[df["current_goal"] == 2]
+
+            if len(g1):
+                wp1 = (
+                    first_finite(g1["x_des"].to_numpy()),
+                    first_finite(g1["y_des"].to_numpy()),
+                    first_finite(g1["z_des"].to_numpy()),
+                )
+
+            if len(g2):
+                wp2 = (
+                    first_finite(g2["x_des"].to_numpy()),
+                    first_finite(g2["y_des"].to_numpy()),
+                    first_finite(g2["z_des"].to_numpy()),
+                )
+
+        # Yaw
+        yaw = get_col(df, "yaw_deg")
+        yaw_des = get_col(df, "yaw_des_deg")
+        yaw_err = get_col(df, "yaw_err_deg")
+        yaw_rate_cmd = get_col(df, "yaw_rate_cmd")
+
+        # Body velocities
+        vx_body_raw = get_col(df, "vx_body_raw")
+        vx_body_cmd = get_col(df, "vx_body_cmd")
+        vx_body_meas = get_col(df, "vx_body_meas")
+
+        vy_body_cmd = get_col(df, "vy_body_cmd")
+        vy_body_meas = get_col(df, "vy_body_meas")
+
+        vz_body_raw = get_col(df, "vz_body_raw")
+        vz_body_cmd = get_col(df, "vz_body_cmd")
+        vz_body_meas = get_col(df, "vz_body_meas")
+
+        # World z terms
+        vz_world_up_raw = get_col(df, "vz_world_up_raw")
+        vz_world_up_cmd = get_col(df, "vz_world_up_cmd")
+        vD_des = get_col(df, "vD_des")
+
+        # Accelerations from logged velocities
+        ax_body_raw = safe_gradient(vx_body_raw, t)
+        ax_body_cmd = safe_gradient(vx_body_cmd, t)
+        ax_body_meas = safe_gradient(vx_body_meas, t)
+
+        ay_body_cmd = safe_gradient(vy_body_cmd, t)
+        ay_body_meas = safe_gradient(vy_body_meas, t)
+
+        az_body_raw = safe_gradient(vz_body_raw, t)
+        az_body_cmd = safe_gradient(vz_body_cmd, t)
+        az_body_meas = safe_gradient(vz_body_meas, t)
+
+        def savefig(name: str):
+            if save:
+                out = os.path.join(args.outdir, f"{args.prefix}_{stem}_{name}.png")
+                plt.savefig(out, dpi=200, bbox_inches="tight")
+
+        # 1) Yaw vs desired yaw
+        plt.figure()
+        plt.plot(t[sl], yaw[sl], label="yaw_deg")
+        if np.isfinite(yaw_des).any():
+            plt.plot(t[sl], yaw_des[sl], label="yaw_des_deg")
+        plt.xlabel("t (s)")
+        plt.ylabel("Yaw (deg)")
+        plt.title(f"Yaw vs desired yaw\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("yaw_vs_desired")
+
+        # 2) Yaw error
+        plt.figure()
+        plt.plot(t[sl], yaw_err[sl], label="yaw_err_deg")
+        plt.axhline(0.0, linestyle="--")
+        plt.xlabel("t (s)")
+        plt.ylabel("Yaw error (deg)")
+        plt.title(f"Yaw error\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("yaw_error")
+
+        # 3) Yaw rate command
+        plt.figure()
+        plt.plot(t[sl], yaw_rate_cmd[sl], label="yaw_rate_cmd")
+        plt.axhline(0.0, linestyle="--")
+        plt.xlabel("t (s)")
+        plt.ylabel("Yaw rate command")
+        plt.title(f"Yaw rate command\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("yaw_rate_cmd")
+
+        # 4) x, y, z vs time
+        plt.figure()
+        plt.plot(t[sl], x[sl], label="x")
+        plt.plot(t[sl], y[sl], label="y")
+        plt.plot(t[sl], z[sl], label="z")
+        if np.isfinite(x_des).any():
+            plt.plot(t[sl], x_des[sl], linestyle="--", label="x_des")
+        if np.isfinite(y_des).any():
+            plt.plot(t[sl], y_des[sl], linestyle="--", label="y_des")
+        if np.isfinite(z_des).any():
+            plt.plot(t[sl], z_des[sl], linestyle="--", label="z_des")
+        plt.xlabel("t (s)")
+        plt.ylabel("Position (m)")
+        plt.title(f"x, y, z vs time\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("xyz_vs_time")
+
+        # 5) XY trajectory with waypoint markers
+        plt.figure()
+        plt.plot(x[sl], y[sl], label="trajectory")
+
+        if len(x) > 0 and np.isfinite(x[0]) and np.isfinite(y[0]):
+            plt.scatter([x[0]], [y[0]], label="start")
+
+        if len(x) > 0 and np.isfinite(x[-1]) and np.isfinite(y[-1]):
+            plt.scatter([x[-1]], [y[-1]], label="end")
+
+        if wp1 is not None and np.isfinite(wp1[0]) and np.isfinite(wp1[1]):
+            plt.scatter([wp1[0]], [wp1[1]], marker="x", s=100, label="waypoint 1")
+
+        if wp2 is not None and np.isfinite(wp2[0]) and np.isfinite(wp2[1]):
+            plt.scatter([wp2[0]], [wp2[1]], marker="x", s=100, label="waypoint 2")
+
+        plt.xlabel("x (m)")
+        plt.ylabel("y (m)")
+        plt.title(f"XY trajectory with waypoints\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        plt.axis("equal")
+        savefig("xy_trajectory_waypoints")
+
+        # 6) Distance to goal
+        plt.figure()
+        plt.plot(t[sl], e_xy_norm[sl], label="e_xy_norm")
+        plt.xlabel("t (s)")
+        plt.ylabel("XY distance to goal (m)")
+        plt.title(f"Distance to goal\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("distance_to_goal")
+
+        # 7) Waypoint switching
+        if has_goal:
+            plt.figure()
+            plt.step(t[sl], current_goal[sl], where="post", label="current_goal")
+            plt.xlabel("t (s)")
+            plt.ylabel("Waypoint")
+            plt.title(f"Waypoint switching\n{Path(csv_path).name}")
+            plt.yticks([1, 2])
+            plt.legend()
+            plt.grid(True)
+            savefig("waypoint_switching")
+
+        # 8) X velocity: raw vs commanded vs measured
+        plt.figure()
+        if np.isfinite(vx_body_raw).any():
+            plt.plot(t[sl], vx_body_raw[sl], label="vx_body_raw")
+        plt.plot(t[sl], vx_body_cmd[sl], label="vx_body_cmd")
+        plt.plot(t[sl], vx_body_meas[sl], label="vx_body_meas")
+        plt.xlabel("t (s)")
+        plt.ylabel("Velocity (m/s)")
+        plt.title(f"X velocity: raw vs commanded vs measured\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("vx_raw_cmd_meas")
+
+        # 9) Y velocity: commanded vs measured
+        plt.figure()
+        plt.plot(t[sl], vy_body_cmd[sl], label="vy_body_cmd")
+        if np.isfinite(vy_body_meas).any():
+            plt.plot(t[sl], vy_body_meas[sl], label="vy_body_meas")
+        plt.xlabel("t (s)")
+        plt.ylabel("Velocity (m/s)")
+        plt.title(f"Y velocity: commanded vs measured\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("vy_cmd_meas")
+
+        # 10) Z velocity: raw vs commanded vs measured
+        plt.figure()
+        if np.isfinite(vz_body_raw).any():
+            plt.plot(t[sl], vz_body_raw[sl], label="vz_body_raw")
+        plt.plot(t[sl], vz_body_cmd[sl], label="vz_body_cmd")
+        if np.isfinite(vz_body_meas).any():
+            plt.plot(t[sl], vz_body_meas[sl], label="vz_body_meas")
+        plt.xlabel("t (s)")
+        plt.ylabel("Velocity (m/s)")
+        plt.title(f"Z velocity: raw vs commanded vs measured\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("vz_raw_cmd_meas")
+
+        # 11) World-z / NED-z command terms
+        plt.figure()
+        if np.isfinite(vz_world_up_raw).any():
+            plt.plot(t[sl], vz_world_up_raw[sl], label="vz_world_up_raw")
+        if np.isfinite(vz_world_up_cmd).any():
+            plt.plot(t[sl], vz_world_up_cmd[sl], label="vz_world_up_cmd")
+        if np.isfinite(vD_des).any():
+            plt.plot(t[sl], vD_des[sl], label="vD_des")
+        plt.xlabel("t (s)")
+        plt.ylabel("Velocity")
+        plt.title(f"World-z / NED-z command terms\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("world_z_terms")
+
+        # 12) X acceleration: raw vs commanded vs measured
+        plt.figure()
+        if np.isfinite(ax_body_raw).any():
+            plt.plot(t[sl], ax_body_raw[sl], label="ax_body_raw")
+        plt.plot(t[sl], ax_body_cmd[sl], label="ax_body_cmd")
+        plt.plot(t[sl], ax_body_meas[sl], label="ax_body_meas")
+        plt.axhline(0.0, linestyle="--")
+        plt.xlabel("t (s)")
+        plt.ylabel("Acceleration (m/s²)")
+        plt.title(f"X acceleration: raw vs commanded vs measured\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("ax_raw_cmd_meas")
+
+        # 13) Y acceleration: commanded vs measured
+        plt.figure()
+        plt.plot(t[sl], ay_body_cmd[sl], label="ay_body_cmd")
+        if np.isfinite(ay_body_meas).any():
+            plt.plot(t[sl], ay_body_meas[sl], label="ay_body_meas")
+        plt.axhline(0.0, linestyle="--")
+        plt.xlabel("t (s)")
+        plt.ylabel("Acceleration (m/s²)")
+        plt.title(f"Y acceleration: commanded vs measured\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("ay_cmd_meas")
+
+        # 14) Z acceleration: raw vs commanded vs measured
+        plt.figure()
+        if np.isfinite(az_body_raw).any():
+            plt.plot(t[sl], az_body_raw[sl], label="az_body_raw")
+        plt.plot(t[sl], az_body_cmd[sl], label="az_body_cmd")
+        if np.isfinite(az_body_meas).any():
+            plt.plot(t[sl], az_body_meas[sl], label="az_body_meas")
+        plt.axhline(0.0, linestyle="--")
+        plt.xlabel("t (s)")
+        plt.ylabel("Acceleration (m/s²)")
+        plt.title(f"Z acceleration: raw vs commanded vs measured\n{Path(csv_path).name}")
+        plt.legend()
+        plt.grid(True)
+        savefig("az_raw_cmd_meas")
+
+    if args.show or not save:
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()

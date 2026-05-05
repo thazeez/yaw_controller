@@ -38,8 +38,12 @@ NEW (minimal change):
 - yaw_des is frozen when close to goal (inside slow-radius zone)
 - hold is sticky once reached
 
+LOGGING ADDITION:
+- Added vy_body_raw = 0.0 to the CSV so Y velocity can be plotted as:
+  raw vs commanded vs measured
+
 PUBLISHES:
-- /cmd_vel (geometry_msgs/Twist)
+- /falcon/cmd_vel (geometry_msgs/Twist)
   linear.x = forward body command (FRD forward)
   linear.y = 0
   linear.z = solved body-z command (FRD down)
@@ -223,7 +227,7 @@ class YawPDController(Node):
             "ez", "dez",
             "yaw_deg", "yaw_des_deg", "yaw_err_deg",
             "vx_body_cmd", "vy_body_cmd", "vz_body_cmd",
-            "vx_body_raw",
+            "vx_body_raw", "vy_body_raw",
             "vx_body_meas", "vy_body_meas", "vz_body_meas",
             "vz_world_up_raw", "vz_world_up_cmd",
             "vD_des",
@@ -341,7 +345,7 @@ class YawPDController(Node):
                 f"{ez:.3f}", "0.000",
                 f"{math.degrees(yaw):.3f}", "nan", "nan",
                 "0.000", "0.000", "0.000",
-                "0.000",
+                "0.000", "0.000",
                 f"{self.vx_body_m:.3f}", f"{self.vy_body_m:.3f}", f"{self.vz_body_m:.3f}",
                 "0.000", "0.000",
                 "0.000",
@@ -382,6 +386,9 @@ class YawPDController(Node):
             vx_body_raw = self.vx_body_cmd_const * scale_xy
         else:
             vx_body_raw = 0.0
+
+        # BODY y raw command is always zero in this controller
+        vy_body_raw = 0.0
 
         # Speed clip to ±vx_body_max
         vel_cmd = clamp(vx_body_raw, -self.vx_body_max, self.vx_body_max)
@@ -452,7 +459,7 @@ class YawPDController(Node):
             f"{math.degrees(yaw_des):.3f}",
             f"{math.degrees(yaw_err):.3f}",
             f"{bx_cmd:.3f}", f"{by_cmd:.3f}", f"{bz_cmd:.3f}",
-            f"{vx_body_raw:.3f}",
+            f"{vx_body_raw:.3f}", f"{vy_body_raw:.3f}",
             f"{self.vx_body_m:.3f}", f"{self.vy_body_m:.3f}", f"{self.vz_body_m:.3f}",
             f"{vz_world_up_raw:.3f}", f"{vz_world_up_cmd:.3f}",
             f"{vD_des:.3f}",
@@ -474,7 +481,7 @@ class YawPDController(Node):
 def main():
     p = argparse.ArgumentParser()
 
-    # Falcon-specific defaults
+    # Owl-specific defaults
     p.add_argument("--pose-topic", default="/Drone_falcon/pose")
     p.add_argument("--odom-topic", default="/falcon/fmu/out/vehicle_odometry")
 
